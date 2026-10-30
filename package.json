@@ -1,0 +1,62 @@
+{
+  "name": "@framy2/agent-wire-tap",
+  "version": "0.1.0",
+  "description": "Zero-cost local loopback HTTP wire interceptor & CI context contract tester for Claude Code, OpenAI Codex CLI, and custom AI agents.",
+  "type": "module",
+  "bin": {
+    "agent-wire-tap": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "openai",
+    "anthropic",
+    "mcp",
+    "wire-tap",
+    "contract-testing",
+    "context-window",
+    "system-prompt",
+    "ci"
+  ],
+  "license": "MIT",
+  "author": "Christian Frascogna <chriss196422@gmail.com> (https://github.com/FramY2)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FramY2/agent-wire-tap.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FramY2/agent-wire-tap/issues"
+  },
+  "homepage": "https://github.com/FramY2/agent-wire-tap#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
