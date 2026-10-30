@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/FramY2/agent-wire-tap/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/FramY2/agent-wire-tap?style=flat&logo=github&color=F59E0B" /></a>
-  <a href="https://github.com/FramY2/agent-wire-tap/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/FramY2/agent-wire-tap/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://github.com/FramY2/agent-wire-tap/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/FramY2/agent-wire-tap/actions/workflows/ci.yml/badge.svg" /></a>
   <img alt="Zero Dependencies" src="https://img.shields.io/badge/dependencies-0-brightgreen" />
   <img alt="Zero API Cost" src="https://img.shields.io/badge/API%20Cost-%240.00-7657FF" />
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2DE2E6" />
