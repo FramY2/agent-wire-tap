@@ -53,8 +53,6 @@ jobs:
       - name: Publish through npm trusted publishing
         if: steps.registry.outputs.published != 'true'
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Confirm pre-published bootstrap version
         if: steps.registry.outputs.published == 'true'
