@@ -106,6 +106,12 @@ export function parseWireTapCliArgs(argv: string[]): ParsedWireTapCliArgs {
         throw new Error("--timeout-ms must be a positive integer.");
       }
       timeoutMs = val;
+    } else if (arg.startsWith("--timeout-ms=")) {
+      const val = Number(arg.slice("--timeout-ms=".length));
+      if (!Number.isInteger(val) || val <= 0) {
+        throw new Error("--timeout-ms must be a positive integer.");
+      }
+      timeoutMs = val;
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${arg}`);
     } else {

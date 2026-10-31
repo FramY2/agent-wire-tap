@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -57,7 +58,7 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
     expect(renderWireTapReport(report)).toContain("[PASS]");
   });
 
-  it("reports contract failures when forbidden strings leak or budgets are exceeded", () => {
+  it("reports contract failures when forbidden strings leak, budgets are exceeded, or 0 requests are captured", () => {
     const leakyPayload = JSON.stringify({
       model: "gpt-6.1-sol",
       instructions: "Secret token: sk-proj-leaked123456",
@@ -75,6 +76,14 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
     expect(report.status).toBe("failed");
     expect(report.failures).toHaveLength(4);
     expect(renderWireTapReport(report)).toContain("[FAIL]");
+
+    const emptyReport = evaluateWireAssertions([], {
+      assertNotContains: ["sk-secret"],
+      assertMaxBytes: 10_000,
+      assertMaxTools: 5,
+    });
+    expect(emptyReport.status).toBe("failed");
+    expect(emptyReport.failures.length).toBeGreaterThan(0);
   });
 
   it("intercepts live outbound agent HTTP calls on ephemeral loopback with zero API cost", async () => {
@@ -121,7 +130,7 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
     expect(report.toolNamesObserved).toEqual(["read_file"]);
   });
 
-  it("supports SSE streaming synthetic responses for Anthropic /v1/messages and OpenAI /v1/responses", async () => {
+  it("supports SSE streaming for Anthropic /v1/messages, OpenAI /v1/responses, and /v1/chat/completions plus gzip request bodies", async () => {
     const tap = await startWireTapServer("streamed ok");
     try {
       const anthropicRes = await fetch(`${tap.baseUrl}/v1/messages`, {
@@ -149,6 +158,38 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
       const openaiSse = await openaiRes.text();
       expect(openaiSse).toContain("event: response.completed");
       expect(openaiSse).toContain("streamed ok");
+
+      const gzippedBody = gzipSync(
+        Buffer.from(
+          JSON.stringify({
+            model: "gpt-6-luna",
+            stream: true,
+            messages: [
+              { role: "system", content: "GZIPPED_AGENTS_MD_MARKER" },
+              { role: "user", content: "hi" },
+            ],
+            tools: [{ function: { name: "search_docs" } }],
+          }),
+          "utf8",
+        ),
+      );
+      const chatSseRes = await fetch(`${tap.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+        },
+        body: gzippedBody,
+      });
+      const chatSse = await chatSseRes.text();
+      expect(chatSse).toContain("chat.completion.chunk");
+      expect(chatSse).toContain("streamed ok");
+      expect(chatSse).toContain("data: [DONE]");
+
+      const lastCaptured = tap.requests[tap.requests.length - 1]!;
+      expect(lastCaptured.model).toBe("gpt-6-luna");
+      expect(lastCaptured.toolNames).toEqual(["search_docs"]);
+      expect(lastCaptured.rawBody).toContain("GZIPPED_AGENTS_MD_MARKER");
     } finally {
       await tap.close();
     }
@@ -162,6 +203,7 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
       "--assert-max-bytes",
       "32768",
       "--assert-max-tools=10",
+      "--timeout-ms=5000",
       "--json",
       "--out",
       "wire-report.json",
@@ -173,6 +215,7 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
 
     expect(parsed.json).toBe(true);
     expect(parsed.outFile).toBe("wire-report.json");
+    expect(parsed.timeoutMs).toBe(5000);
     expect(parsed.assertions.assertContains).toEqual(["AGENTS.md"]);
     expect(parsed.assertions.assertNotContains).toEqual(["sk-ant-"]);
     expect(parsed.assertions.assertMaxBytes).toBe(32768);
