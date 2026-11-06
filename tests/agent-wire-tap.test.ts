@@ -223,4 +223,94 @@ describe("agent-wire-tap — payload analysis & contract assertions", () => {
     expect(parsed.command).toBe("codex");
     expect(parsed.commandArgs).toEqual(["exec", "ping"]);
   });
+
+  it("counts unnamed and built-in tools in toolsCount and falls back to rec.type for toolNames (Issue #1)", async () => {
+    const mixedToolsPayload = JSON.stringify({
+      model: "gpt-6.1-sol",
+      input: [{ role: "user", content: "Search and summarize" }],
+      tools: [
+        { type: "function", name: "read_file", parameters: { type: "object" } },
+        { type: "function", function: { name: "write_file" } },
+        { type: "web_search" },
+        { type: "file_search" },
+        { type: "   " },
+        {},
+      ],
+    });
+
+    const analyzed = analyzeWirePayload(
+      "POST",
+      "/v1/responses",
+      mixedToolsPayload,
+    );
+    expect(analyzed.toolsCount).toBe(6);
+    expect(analyzed.toolNames).toEqual([
+      "read_file",
+      "write_file",
+      "web_search",
+      "file_search",
+    ]);
+
+    const failingReport = evaluateWireAssertions([analyzed], {
+      assertMaxTools: 5,
+    });
+    expect(failingReport.status).toBe("failed");
+    expect(failingReport.maxToolsCount).toBe(6);
+    expect(failingReport.failures).toEqual([
+      "Maximum tools schema count (6) exceeded budget (> 5 tools).",
+    ]);
+
+    const passingReport = evaluateWireAssertions([analyzed], {
+      assertMaxTools: 6,
+    });
+    expect(passingReport.status).toBe("passed");
+
+    // E2E verification with live loopback server and unnamed built-in tools exceeding budget
+    const dir = await mkdtemp(join(tmpdir(), "agent-wire-tap-issue1-"));
+    tempDirs.push(dir);
+    const fakeAgentScript = join(dir, "fake-agent-builtins.mjs");
+
+    await writeFile(
+      fakeAgentScript,
+      [
+        "const baseUrl = process.env.OPENAI_BASE_URL;",
+        'const res = await fetch(`${baseUrl}/responses`, {',
+        '  method: "POST",',
+        '  headers: { "content-type": "application/json" },',
+        "  body: JSON.stringify({",
+        '    model: "gpt-6.1-sol",',
+        '    input: [{ role: "user", content: "ping" }],',
+        "    tools: [",
+        '      { name: "bash" },',
+        '      { type: "web_search" },',
+        '      { type: "file_search" },',
+        "      {}",
+        "    ]",
+        "  })",
+        "});",
+        "await res.json();",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const { report } = await runAgentCommandWithWireTap({
+      command: process.execPath,
+      args: [fakeAgentScript],
+      assertions: {
+        assertMaxTools: 3,
+      },
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.maxToolsCount).toBe(4);
+    expect(report.toolNamesObserved).toEqual([
+      "bash",
+      "file_search",
+      "web_search",
+    ]);
+    expect(report.failures).toContain(
+      "Maximum tools schema count (4) exceeded budget (> 3 tools).",
+    );
+  });
 });
+

@@ -141,9 +141,9 @@ function getVersion(): string {
     const pkg = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { version?: string };
-    return pkg.version ?? "0.1.0";
+    return pkg.version ?? "0.1.1";
   } catch {
-    return "0.1.0";
+    return "0.1.1";
   }
 }
 

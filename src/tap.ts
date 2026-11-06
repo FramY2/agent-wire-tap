@@ -99,6 +99,7 @@ export function analyzeWirePayload(
 
   let model: string | null = null;
   let systemPromptChars = 0;
+  let toolsCount = 0;
   const toolNames: string[] = [];
   let toolsSchemaBytes = 0;
 
@@ -130,6 +131,7 @@ export function analyzeWirePayload(
     }
 
     if (Array.isArray(parsed.tools)) {
+      toolsCount = parsed.tools.length;
       toolsSchemaBytes = Buffer.byteLength(
         JSON.stringify(parsed.tools),
         "utf8",
@@ -137,16 +139,20 @@ export function analyzeWirePayload(
       for (const tool of parsed.tools) {
         if (!tool || typeof tool !== "object") continue;
         const rec = tool as Record<string, unknown>;
-        if (typeof rec.name === "string") {
+        if (typeof rec.name === "string" && rec.name.trim().length > 0) {
           toolNames.push(rec.name);
         } else if (
           rec.function &&
           typeof rec.function === "object" &&
-          typeof (rec.function as Record<string, unknown>).name === "string"
+          typeof (rec.function as Record<string, unknown>).name === "string" &&
+          ((rec.function as Record<string, unknown>).name as string).trim()
+            .length > 0
         ) {
           toolNames.push(
             (rec.function as Record<string, unknown>).name as string,
           );
+        } else if (typeof rec.type === "string" && rec.type.trim().length > 0) {
+          toolNames.push(rec.type);
         }
       }
     }
@@ -161,7 +167,7 @@ export function analyzeWirePayload(
     bodyBytes,
     estimatedTokens,
     systemPromptChars,
-    toolsCount: toolNames.length,
+    toolsCount,
     toolNames,
     toolsSchemaBytes,
     estimatedToolTokens: Math.ceil(toolsSchemaBytes / 4),
