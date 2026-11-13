@@ -1,13 +1,31 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve as resolvePath } from "node:path";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
+
+import {
+  analyzePromptPrefix,
+  deriveSessionKey,
+  PromptCacheTracker,
+  type CacheDiagnostics,
+  type DivergentLayer,
+} from "./prefix.js";
+import {
+  createUpstreamAgents,
+  forwardToUpstream,
+  resolveUpstreamUrl,
+  type PassthroughOptions,
+  type UpstreamExchange,
+} from "./proxy.js";
+import { redactHeaders, redactUrl } from "./redact.js";
+import { isLlmEndpoint } from "./usage.js";
 
 export interface CapturedWireRequest {
   method: string;
@@ -21,6 +39,36 @@ export interface CapturedWireRequest {
   toolsSchemaBytes: number;
   estimatedToolTokens: number;
   rawBody: string;
+  /** Turn-over-turn prompt-prefix hash & cache_control diagnostics (LLM endpoints only). */
+  cacheDiagnostics?: CacheDiagnostics;
+  /** Present in `--passthrough` mode: real upstream exchange (credentials redacted). */
+  upstream?: UpstreamExchange;
+}
+
+export type WireTapMode = "mock" | "passthrough";
+
+export interface WireTapUsageTotals {
+  requestsWithUsage: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  totalPromptTokens: number;
+  /** cacheReadInputTokens / totalPromptTokens across all requests with usage (0..1). */
+  cacheHitRatio: number | null;
+}
+
+export interface WireTapCacheDivergence {
+  requestIndex: number;
+  comparedToRequest: number | null;
+  url: string;
+  model: string | null;
+  matchedPrefixBlocks: number;
+  totalBlocks: number;
+  firstDivergentLayer: Exclude<DivergentLayer, "none">;
+  firstDivergentIndex: string | null;
+  divergedBeforeBreakpoint: boolean;
+  reason: string;
 }
 
 export interface WireTapAssertions {
@@ -48,6 +96,12 @@ export interface WireTapReport {
   requests: Array<Omit<CapturedWireRequest, "rawBody">>;
   assertions: WireTapAssertionResult[];
   failures: string[];
+  /** `mock` (synthetic $0 replies, default) or `passthrough` (live upstream). */
+  mode: WireTapMode;
+  /** Real upstream token & prompt-cache usage totals (passthrough mode), else null. */
+  usageTotals: WireTapUsageTotals | null;
+  /** Requests whose prompt prefix diverged from the previous turn. */
+  cacheDivergences: WireTapCacheDivergence[];
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -374,9 +428,58 @@ function writeSyntheticReply(
   );
 }
 
+export function summarizeUsage(
+  requests: Array<Pick<CapturedWireRequest, "upstream">>,
+): WireTapUsageTotals | null {
+  const usages = requests
+    .map((r) => r.upstream?.usage)
+    .filter((u): u is NonNullable<typeof u> => Boolean(u));
+  if (usages.length === 0) return null;
+  const sum = (pick: (u: (typeof usages)[number]) => number | null) =>
+    usages.reduce((acc, u) => acc + (pick(u) ?? 0), 0);
+  const totalPromptTokens = sum((u) => u.totalPromptTokens);
+  const cacheReadInputTokens = sum((u) => u.cacheReadInputTokens);
+  return {
+    requestsWithUsage: usages.length,
+    inputTokens: sum((u) => u.inputTokens),
+    outputTokens: sum((u) => u.outputTokens),
+    cacheReadInputTokens,
+    cacheCreationInputTokens: sum((u) => u.cacheCreationInputTokens),
+    totalPromptTokens,
+    cacheHitRatio:
+      totalPromptTokens > 0
+        ? Math.round((cacheReadInputTokens / totalPromptTokens) * 10_000) / 10_000
+        : null,
+  };
+}
+
+export function summarizeCacheDivergences(
+  requests: Array<Pick<CapturedWireRequest, "url" | "model" | "cacheDiagnostics">>,
+): WireTapCacheDivergence[] {
+  const out: WireTapCacheDivergence[] = [];
+  requests.forEach((r, requestIndex) => {
+    const d = r.cacheDiagnostics;
+    if (!d || d.firstDivergentLayer === "none") return;
+    out.push({
+      requestIndex,
+      comparedToRequest: d.comparedToRequest,
+      url: r.url,
+      model: r.model,
+      matchedPrefixBlocks: d.matchedPrefixBlocks,
+      totalBlocks: d.totalBlocks,
+      firstDivergentLayer: d.firstDivergentLayer,
+      firstDivergentIndex: d.firstDivergentIndex,
+      divergedBeforeBreakpoint: d.divergedBeforeBreakpoint,
+      reason: d.reason,
+    });
+  });
+  return out;
+}
+
 export function evaluateWireAssertions(
   requests: CapturedWireRequest[],
   assertions: WireTapAssertions = {},
+  meta: { mode?: WireTapMode } = {},
 ): WireTapReport {
   const combinedRaw = requests.map((r) => r.rawBody).join("\n");
   const totalPayloadBytes = requests.reduce((sum, r) => sum + r.bodyBytes, 0);
@@ -471,6 +574,9 @@ export function evaluateWireAssertions(
     requests: requests.map(({ rawBody: _raw, ...rest }) => rest),
     assertions: results,
     failures,
+    mode: meta.mode ?? (requests.some((r) => r.upstream) ? "passthrough" : "mock"),
+    usageTotals: summarizeUsage(requests),
+    cacheDivergences: summarizeCacheDivergences(requests),
   };
 }
 
@@ -478,13 +584,72 @@ export interface EphemeralWireTapServer {
   baseUrl: string;
   port: number;
   requests: CapturedWireRequest[];
+  mode: WireTapMode;
   close: () => Promise<void>;
 }
 
+export interface WireTapServerOptions {
+  /** Text returned by synthetic mock replies (mock mode only). */
+  syntheticText?: string;
+  /** Enable live pass-through reverse-proxy mode (`true` = auto-route to official APIs). */
+  passthrough?: PassthroughOptions | boolean;
+  /** Bind host (default `127.0.0.1`). */
+  host?: string;
+  /** Bind port (default `0` = ephemeral). */
+  port?: number;
+  /** JSONL trace file: one redacted record per completed exchange (truncated on start). */
+  traceFile?: string;
+  /** Called after each exchange completes (response fully delivered). */
+  onExchange?: (record: CapturedWireRequest, index: number) => void;
+}
+
+/** The persisted/serialized shape of a captured request: never contains `rawBody`. */
+export function toTraceRecord(
+  record: CapturedWireRequest,
+  index: number,
+  mode: WireTapMode,
+): Record<string, unknown> {
+  const { rawBody: _raw, ...rest } = record;
+  return { timestamp: new Date().toISOString(), index, mode, ...rest };
+}
+
 export async function startWireTapServer(
-  syntheticText?: string,
+  options: string | WireTapServerOptions = {},
 ): Promise<EphemeralWireTapServer> {
+  const opts: WireTapServerOptions =
+    typeof options === "string" ? { syntheticText: options } : options;
+  const passthrough: PassthroughOptions | null =
+    opts.passthrough === true
+      ? {}
+      : opts.passthrough && typeof opts.passthrough === "object"
+        ? opts.passthrough
+        : null;
+  const mode: WireTapMode = passthrough ? "passthrough" : "mock";
   const requests: CapturedWireRequest[] = [];
+  const tracker = new PromptCacheTracker();
+  const agents = passthrough ? createUpstreamAgents() : null;
+  const pending = new Set<Promise<void>>();
+
+  const traceFile = opts.traceFile ? resolvePath(opts.traceFile) : null;
+  let traceChain: Promise<void> = Promise.resolve();
+  if (traceFile) {
+    await mkdir(dirname(traceFile), { recursive: true });
+    await writeFile(traceFile, "", "utf8");
+  }
+
+  const completeExchange = (record: CapturedWireRequest, index: number) => {
+    if (traceFile) {
+      const line = `${JSON.stringify(toTraceRecord(record, index, mode))}\n`;
+      traceChain = traceChain
+        .then(() => appendFile(traceFile, line, "utf8"))
+        .catch(() => undefined);
+    }
+    try {
+      opts.onExchange?.(record, index);
+    } catch {
+      // Observer errors must never break the proxy.
+    }
+  };
 
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -497,29 +662,91 @@ export async function startWireTapServer(
           ? req.headers["content-encoding"]
           : undefined,
       );
-      requests.push(
-        analyzeWirePayload(req.method ?? "POST", req.url ?? "/", rawBody),
+      const reqUrl = req.url ?? "/";
+      const record = analyzeWirePayload(
+        req.method ?? "POST",
+        redactUrl(reqUrl),
+        rawBody,
       );
-      writeSyntheticReply(req, res, rawBody, syntheticText);
+      const index = requests.length;
+      if (isLlmEndpoint(reqUrl)) {
+        const snapshot = analyzePromptPrefix(rawBody, reqUrl);
+        if (snapshot) {
+          record.cacheDiagnostics = tracker.observe(
+            index,
+            deriveSessionKey(reqUrl, req.headers, rawBody),
+            snapshot,
+          );
+        }
+      }
+      requests.push(record);
+
+      if (!passthrough || !agents) {
+        writeSyntheticReply(req, res, rawBody, opts.syntheticText);
+        completeExchange(record, index);
+        return;
+      }
+
+      const target = resolveUpstreamUrl(reqUrl, passthrough);
+      record.upstream = {
+        url: redactUrl(target.href),
+        status: null,
+        durationMs: null,
+        streamed: false,
+        requestHeaders: redactHeaders(req.headers),
+        responseHeaders: {},
+        usage: null,
+      };
+      const exchange = forwardToUpstream({
+        req,
+        res,
+        body: rawBuffer,
+        target,
+        agents,
+      }).then((result) => {
+        Object.assign(record.upstream!, result);
+        completeExchange(record, index);
+      });
+      pending.add(exchange);
+      void exchange.finally(() => pending.delete(exchange));
     });
   });
 
+  const host = opts.host ?? "127.0.0.1";
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
+    server.listen(opts.port ?? 0, host, () => resolve());
   });
 
   const addr = server.address() as AddressInfo;
-  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  const displayHost =
+    host === "0.0.0.0" || host === "::"
+      ? "127.0.0.1"
+      : host.includes(":")
+        ? `[${host}]`
+        : host;
+  const baseUrl = `http://${displayHost}:${addr.port}`;
 
   return {
     baseUrl,
     port: addr.port,
     requests,
-    close: () =>
-      new Promise<void>((resolve) => {
+    mode,
+    close: async () => {
+      if (pending.size > 0) {
+        await Promise.race([
+          Promise.allSettled([...pending]),
+          new Promise((r) => setTimeout(r, 2_000).unref()),
+        ]);
+      }
+      await new Promise<void>((resolve) => {
         server.close(() => resolve());
-      }),
+        server.closeIdleConnections?.();
+        if (pending.size > 0) server.closeAllConnections?.();
+      });
+      agents?.destroy();
+      await traceChain;
+    },
   };
 }
 
@@ -576,14 +803,29 @@ export async function runAgentCommandWithWireTap(options: {
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   assertions?: WireTapAssertions;
+  /** Live pass-through to the real upstream APIs instead of synthetic replies. */
+  passthrough?: PassthroughOptions | boolean;
+  /** JSONL trace file (one redacted record per exchange). */
+  traceFile?: string;
+  /** Fixed proxy port (default: ephemeral). */
+  port?: number;
+  host?: string;
+  onExchange?: (record: CapturedWireRequest, index: number) => void;
 }): Promise<{
   report: WireTapReport;
   exitCode: number | null;
   stdout: string;
   stderr: string;
 }> {
-  const tap = await startWireTapServer();
+  const tap = await startWireTapServer({
+    ...(options.passthrough ? { passthrough: options.passthrough } : {}),
+    ...(options.traceFile ? { traceFile: options.traceFile } : {}),
+    ...(options.port !== undefined ? { port: options.port } : {}),
+    ...(options.host ? { host: options.host } : {}),
+    ...(options.onExchange ? { onExchange: options.onExchange } : {}),
+  });
   const timeoutMs = options.timeoutMs ?? 15_000;
+  let closed = false;
 
   try {
     const env: NodeJS.ProcessEnv = {
@@ -592,16 +834,21 @@ export async function runAgentCommandWithWireTap(options: {
       OPENAI_BASE_URL: `${tap.baseUrl}/v1`,
       OPENAI_API_BASE: `${tap.baseUrl}/v1`,
       ANTHROPIC_BASE_URL: tap.baseUrl,
-      OPENAI_API_KEY:
-        options.env?.OPENAI_API_KEY ??
-        process.env.OPENAI_API_KEY ??
-        "sk-wiretap-local-loopback-000000000000",
-      ANTHROPIC_API_KEY:
-        options.env?.ANTHROPIC_API_KEY ??
-        process.env.ANTHROPIC_API_KEY ??
-        "sk-ant-wiretap-local-loopback-000000000000",
       WIRE_TAP_BASE_URL: tap.baseUrl,
     };
+    if (tap.mode === "mock") {
+      // Mock mode only: placeholder keys so agents start without real credentials.
+      // In passthrough mode the agent's own credentials (API key or OAuth) are
+      // forwarded untouched, so nothing is injected.
+      env.OPENAI_API_KEY =
+        options.env?.OPENAI_API_KEY ??
+        process.env.OPENAI_API_KEY ??
+        "sk-wiretap-local-loopback-000000000000";
+      env.ANTHROPIC_API_KEY =
+        options.env?.ANTHROPIC_API_KEY ??
+        process.env.ANTHROPIC_API_KEY ??
+        "sk-ant-wiretap-local-loopback-000000000000";
+    }
 
     const resolved = resolveWindowsSpawn(options.command, options.args, env);
 
@@ -649,14 +896,64 @@ export async function runAgentCommandWithWireTap(options: {
       });
     });
 
-    const report = evaluateWireAssertions(tap.requests, options.assertions);
+    // Let in-flight exchanges finish (usage parsed, trace flushed) before reporting.
+    closed = true;
+    await tap.close();
+    const report = evaluateWireAssertions(tap.requests, options.assertions, {
+      mode: tap.mode,
+    });
     return {
       report,
       ...execResult,
     };
   } finally {
-    await tap.close();
+    if (!closed) await tap.close();
   }
+}
+
+function fmt(n: number | null | undefined): string {
+  return typeof n === "number" ? n.toLocaleString("en-US") : "?";
+}
+
+/** One-line human summary of a single exchange (used by the live proxy log). */
+export function formatExchangeLine(
+  req: Omit<CapturedWireRequest, "rawBody">,
+  index: number,
+): string {
+  const parts = [`#${index} ${req.method} ${req.url}`];
+  if (req.upstream) {
+    parts[0] += ` -> ${req.upstream.status ?? "ERR"}`;
+    if (req.upstream.durationMs !== null) parts.push(`${req.upstream.durationMs}ms`);
+    if (req.upstream.streamed) parts.push("SSE");
+  }
+  parts.push(`model=${req.model ?? "unknown"}`);
+  const u = req.upstream?.usage;
+  if (u) {
+    parts.push(
+      `in=${fmt(u.inputTokens)} cache_read=${fmt(u.cacheReadInputTokens)} cache_write=${fmt(u.cacheCreationInputTokens)} out=${fmt(u.outputTokens)}${
+        u.cacheHitRatio !== null ? ` (hit ${(u.cacheHitRatio * 100).toFixed(1)}%)` : ""
+      }`,
+    );
+  }
+  if (req.upstream?.error) parts.push(`error: ${req.upstream.error}`);
+  const lines = [parts.join(" · ")];
+  const diag = formatCacheDiagnosticsLine(req.cacheDiagnostics);
+  if (diag) lines.push(diag);
+  return lines.join("\n");
+}
+
+function formatCacheDiagnosticsLine(d: CacheDiagnostics | undefined): string | null {
+  if (!d) return null;
+  const bps = `${d.cacheBreakpoints.count} cache_control breakpoint(s)`;
+  if (d.comparedToRequest === null) {
+    return `  ↳ prefix baseline · ${d.totalBlocks} blocks · ${bps} · hash ${d.prefixHash}`;
+  }
+  if (d.firstDivergentLayer === "none") {
+    return `  ↳ prefix ${d.matchedPrefixBlocks}/${d.totalBlocks} blocks match #${d.comparedToRequest} · ${bps} · ${d.reason}`;
+  }
+  return `  ↳ PREFIX DIVERGED at ${d.firstDivergentIndex} (${d.firstDivergentLayer}) vs #${d.comparedToRequest} · ${d.matchedPrefixBlocks}/${d.totalBlocks} blocks match${
+    d.divergedBeforeBreakpoint ? " · BEFORE cache_control breakpoint (cache invalidated)" : ""
+  } · ${d.reason}`;
 }
 
 export function renderWireTapReport(report: WireTapReport): string {
@@ -668,6 +965,41 @@ export function renderWireTapReport(report: WireTapReport): string {
     lines.push(
       `- ${req.method} ${req.url} · model=${req.model ?? "unknown"} · ${req.bodyBytes.toLocaleString("en-US")} bytes (~${req.estimatedTokens.toLocaleString("en-US")} tokens) · system=${req.systemPromptChars.toLocaleString("en-US")} chars · tools=${req.toolsCount}`,
     );
+    if (req.upstream) {
+      const u = req.upstream.usage;
+      lines.push(
+        `  ↳ upstream ${req.upstream.url} -> ${req.upstream.status ?? "ERR"}${
+          req.upstream.durationMs !== null ? ` · ${req.upstream.durationMs}ms` : ""
+        }${req.upstream.streamed ? " · SSE" : ""}${
+          u
+            ? ` · in=${fmt(u.inputTokens)} cache_read=${fmt(u.cacheReadInputTokens)} cache_write=${fmt(u.cacheCreationInputTokens)} out=${fmt(u.outputTokens)}`
+            : ""
+        }${req.upstream.error ? ` · error: ${req.upstream.error}` : ""}`,
+      );
+    }
+    const diag = formatCacheDiagnosticsLine(req.cacheDiagnostics);
+    if (diag && req.cacheDiagnostics?.comparedToRequest !== null) lines.push(diag);
+  }
+
+  const totals = report.usageTotals;
+  if (totals) {
+    lines.push(
+      "",
+      `Prompt cache (real upstream usage, ${totals.requestsWithUsage} requests): prompt=${fmt(totals.totalPromptTokens)} · cache_read=${fmt(totals.cacheReadInputTokens)} · cache_write=${fmt(totals.cacheCreationInputTokens)} · uncached_in=${fmt(totals.inputTokens)} · out=${fmt(totals.outputTokens)}${
+        totals.cacheHitRatio !== null ? ` · hit ratio ${(totals.cacheHitRatio * 100).toFixed(1)}%` : ""
+      }`,
+    );
+  }
+
+  if (report.cacheDivergences.length > 0) {
+    lines.push("", "Prompt-prefix divergences (cache-miss suspects):");
+    for (const d of report.cacheDivergences) {
+      lines.push(
+        `- request #${d.requestIndex} vs #${d.comparedToRequest ?? "?"} · ${d.firstDivergentIndex} (${d.firstDivergentLayer}) · ${d.matchedPrefixBlocks}/${d.totalBlocks} blocks match${
+          d.divergedBeforeBreakpoint ? " · BEFORE cache_control breakpoint" : ""
+        } · ${d.reason}`,
+      );
+    }
   }
 
   if (report.assertions.length > 0) {
