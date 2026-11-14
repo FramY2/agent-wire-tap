@@ -50,11 +50,35 @@ export interface CacheBreakpointPosition {
   ttl?: string;
 }
 
+export interface WireContractMetadata {
+  /** Tool names in exact wire order (from `tools[]`). */
+  toolNames: string[];
+  /** True when `toolNames` is sorted ascending via `localeCompare <= 0` (matching `mcp-diet`). */
+  toolsSorted: boolean;
+  /** First adjacent pair `[prev, curr]` with `prev.localeCompare(curr) > 0`, or `null` when sorted. */
+  firstUnsortedPair: [string, string] | null;
+  /** True when `tools[]` has at least one tool entry. */
+  hasTools: boolean;
+  /**
+   * True when `hasTools` is false OR at least one `cache_control` breakpoint
+   * sits at or after `lastToolBlockIndex` (on `tools[last]`, `system`, `messages`,
+   * or top-level `body.cache_control`).
+   */
+  cacheBreakpointCoversTools: boolean;
+  /** Flattened block index of `tools[tools.length - 1]`, or `null` when `hasTools` is false. */
+  lastToolBlockIndex: number | null;
+  /** Highest flattened block index carrying a `cache_control` breakpoint, or `null` if none exist. */
+  maxBreakpointBlockIndex: number | null;
+  /** True when top-level `body.cache_control` is present. */
+  hasTopLevelCacheControl: boolean;
+}
+
 export interface PromptPrefixSnapshot {
   provider: LlmProvider;
   model: string | null;
   blocks: PromptBlock[];
   breakpoints: CacheBreakpointPosition[];
+  wireContract: WireContractMetadata;
 }
 
 export interface CacheBreakpointSummary {
@@ -85,6 +109,8 @@ export interface CacheDiagnostics {
   layerHashes: Record<PromptLayer, string>;
   /** First 16 hex chars of SHA-256 over the entire ordered prefix. */
   prefixHash: string;
+  /** Serialized wire-contract invariants (tool sort order + breakpoint coverage). */
+  wireContract: WireContractMetadata;
 }
 
 const SCHEMA_KEYS = new Set(["input_schema", "parameters", "schema", "json_schema"]);
@@ -141,6 +167,83 @@ function cacheControlTtl(value: unknown): string | undefined {
   return cc && typeof cc.ttl === "string" ? cc.ttl : undefined;
 }
 
+/** Checks whether `toolNames` is sorted ascending via `localeCompare <= 0` (matching `mcp-diet`). */
+export function checkToolsSorted(toolNames: readonly string[]): {
+  toolsSorted: boolean;
+  firstUnsortedPair: [string, string] | null;
+} {
+  for (let i = 1; i < toolNames.length; i++) {
+    const prev = toolNames[i - 1]!;
+    const curr = toolNames[i]!;
+    if (prev.localeCompare(curr) > 0) {
+      return { toolsSorted: false, firstUnsortedPair: [prev, curr] };
+    }
+  }
+  return { toolsSorted: true, firstUnsortedPair: null };
+}
+
+/**
+ * Reconstructs `WireContractMetadata` from `CacheDiagnostics` when replaying
+ * older v0.2.0 traces/reports that did not persist `wireContract`.
+ */
+export function inferWireContract(
+  diag: Omit<CacheDiagnostics, "wireContract"> & { wireContract?: WireContractMetadata },
+  fallbackToolNames: readonly string[] = [],
+  fallbackToolsCount = 0,
+): WireContractMetadata {
+  if (diag.wireContract) return diag.wireContract;
+  const toolNames = [...fallbackToolNames];
+  const { toolsSorted, firstUnsortedPair } = checkToolsSorted(toolNames);
+  const modelCount = diag.layerBlockCounts.model;
+  const toolsCount = Math.max(diag.layerBlockCounts.tools, fallbackToolsCount);
+  const systemCount = diag.layerBlockCounts.system;
+  const hasTools = toolsCount > 0;
+  const lastToolBlockIndex = hasTools ? modelCount + toolsCount - 1 : null;
+  const hasTopLevelCacheControl = diag.cacheBreakpoints.positions.some((p) =>
+    p.startsWith("auto:"),
+  );
+
+  let maxBreakpointBlockIndex: number | null = null;
+  for (const rawPos of diag.cacheBreakpoints.positions) {
+    let idx: number | null = null;
+    if (rawPos.startsWith("auto:")) {
+      idx = diag.totalBlocks > 0 ? diag.totalBlocks - 1 : null;
+    } else {
+      const toolMatch = /^tools\[(\d+)\]$/.exec(rawPos);
+      const sysMatch = /^system\[(\d+)\]$/.exec(rawPos);
+      const msgMatch = /^(?:messages|input)\[(\d+)\](?:\.content\[\d+\])?$/.exec(rawPos);
+      if (toolMatch) {
+        idx = modelCount + Number(toolMatch[1]);
+      } else if (sysMatch) {
+        idx = modelCount + toolsCount + Number(sysMatch[1]);
+      } else if (rawPos === "instructions") {
+        idx = modelCount + toolsCount + Math.max(0, systemCount - 1);
+      } else if (msgMatch) {
+        idx = modelCount + toolsCount + systemCount + Number(msgMatch[1]);
+      }
+    }
+    if (idx !== null) {
+      maxBreakpointBlockIndex =
+        maxBreakpointBlockIndex === null ? idx : Math.max(maxBreakpointBlockIndex, idx);
+    }
+  }
+
+  const cacheBreakpointCoversTools =
+    lastToolBlockIndex === null ||
+    (maxBreakpointBlockIndex !== null && maxBreakpointBlockIndex >= lastToolBlockIndex);
+
+  return {
+    toolNames,
+    toolsSorted,
+    firstUnsortedPair,
+    hasTools,
+    cacheBreakpointCoversTools,
+    lastToolBlockIndex,
+    maxBreakpointBlockIndex,
+    hasTopLevelCacheControl,
+  };
+}
+
 /**
  * Normalizes an LLM request body into an ordered list of SHA-256-hashed
  * prefix blocks (`model`, `tools[i]`, `system[i]` / `instructions`,
@@ -190,14 +293,19 @@ export function analyzePromptPrefix(
     breakpoints.push({ layer, path, blockIndex, ...(ttl ? { ttl } : {}) });
   };
 
+  // Anthropic prefix order: model -> tools -> system -> messages.
   const model = typeof parsed.model === "string" ? parsed.model : null;
   addBlock("model", "model", model);
 
+  const toolNames: string[] = [];
+  let lastToolBlockIndex: number | null = null;
   if (Array.isArray(parsed.tools)) {
     parsed.tools.forEach((tool, i) => {
       const name = toolName(tool);
+      if (name) toolNames.push(name);
       const idx = addBlock("tools", `tools[${i}]`, tool, name ? { name } : {});
-      const cc = asRecord(tool)?.cache_control;
+      lastToolBlockIndex = idx;
+      const cc = asRecord(asRecord(tool)?.cache_control);
       if (cc) addBreakpoint("tools", `tools[${i}]`, idx, cc);
     });
   }
@@ -207,7 +315,7 @@ export function analyzePromptPrefix(
   } else if (Array.isArray(parsed.system)) {
     parsed.system.forEach((block, i) => {
       const idx = addBlock("system", `system[${i}]`, block);
-      const cc = asRecord(block)?.cache_control;
+      const cc = asRecord(asRecord(block)?.cache_control);
       if (cc) addBreakpoint("system", `system[${i}]`, idx, cc);
     });
   }
@@ -228,10 +336,11 @@ export function analyzePromptPrefix(
         const role = typeof msg?.role === "string" ? msg.role : undefined;
         const path = `${field}[${i}]`;
         const idx = addBlock("messages", path, item, role ? { role } : {});
-        if (msg?.cache_control) addBreakpoint("messages", path, idx, msg.cache_control);
+        const msgCc = asRecord(msg?.cache_control);
+        if (msgCc) addBreakpoint("messages", path, idx, msgCc);
         if (Array.isArray(msg?.content)) {
           msg.content.forEach((part, j) => {
-            const cc = asRecord(part)?.cache_control;
+            const cc = asRecord(asRecord(part)?.cache_control);
             if (cc) addBreakpoint("messages", `${path}.content[${j}]`, idx, cc);
           });
         }
@@ -242,17 +351,44 @@ export function analyzePromptPrefix(
   }
 
   // Anthropic top-level automatic caching: breakpoint on the last cacheable block.
-  if (asRecord(parsed.cache_control) && blocks.length > 0) {
+  const topLevelCacheControl = asRecord(parsed.cache_control);
+  const hasTopLevelCacheControl = Boolean(topLevelCacheControl);
+  if (topLevelCacheControl && blocks.length > 0) {
     const last = blocks.length - 1;
     addBreakpoint(
       blocks[last]!.layer,
       `auto:${blocks[last]!.path}`,
       last,
-      parsed.cache_control,
+      topLevelCacheControl,
     );
   }
 
-  return { provider: detectProvider(url), model, blocks, breakpoints };
+  const { toolsSorted, firstUnsortedPair } = checkToolsSorted(toolNames);
+  const hasTools = lastToolBlockIndex !== null;
+  const maxBreakpointBlockIndex =
+    breakpoints.length > 0
+      ? breakpoints.reduce((max, bp) => Math.max(max, bp.blockIndex), -1)
+      : null;
+  const cacheBreakpointCoversTools =
+    lastToolBlockIndex === null ||
+    (maxBreakpointBlockIndex !== null && maxBreakpointBlockIndex >= lastToolBlockIndex);
+
+  return {
+    provider: detectProvider(url),
+    model,
+    blocks,
+    breakpoints,
+    wireContract: {
+      toolNames,
+      toolsSorted,
+      firstUnsortedPair,
+      hasTools,
+      cacheBreakpointCoversTools,
+      lastToolBlockIndex,
+      maxBreakpointBlockIndex,
+      hasTopLevelCacheControl,
+    },
+  };
 }
 
 const VOLATILE_VALUE =
@@ -416,6 +552,7 @@ export function diffPromptPrefix(
     totalBlocks: current.blocks.length,
     cacheBreakpoints,
     ...layerSummary(current),
+    wireContract: current.wireContract,
   };
 
   if (!previous) {

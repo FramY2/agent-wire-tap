@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
@@ -13,9 +13,12 @@ import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import {
   analyzePromptPrefix,
   deriveSessionKey,
+  inferWireContract,
+  PROMPT_LAYER_ORDER,
   PromptCacheTracker,
   type CacheDiagnostics,
   type DivergentLayer,
+  type PromptLayer,
 } from "./prefix.js";
 import {
   createUpstreamAgents,
@@ -76,10 +79,22 @@ export interface WireTapAssertions {
   assertNotContains?: string[];
   assertMaxBytes?: number;
   assertMaxTools?: number;
+  assertToolsSorted?: boolean;
+  assertCacheBreakpointCoversTools?: boolean;
+  assertNoPrefixDivergence?: boolean;
+  assertLayerHashes?: Record<string, string>;
 }
 
 export interface WireTapAssertionResult {
-  kind: "contains" | "not-contains" | "max-bytes" | "max-tools";
+  kind:
+    | "contains"
+    | "not-contains"
+    | "max-bytes"
+    | "max-tools"
+    | "tools-sorted"
+    | "cache-breakpoint-covers-tools"
+    | "no-prefix-divergence"
+    | "layer-hash";
   target: string | number;
   passed: boolean;
   message: string;
@@ -476,68 +491,131 @@ export function summarizeCacheDivergences(
   return out;
 }
 
+function ensureCacheDiagnostics(
+  requests: CapturedWireRequest[],
+): CapturedWireRequest[] {
+  const tracker = new PromptCacheTracker();
+  return requests.map((req, index) => {
+    if (req.cacheDiagnostics) {
+      return {
+        ...req,
+        cacheDiagnostics: {
+          ...req.cacheDiagnostics,
+          wireContract: inferWireContract(
+            req.cacheDiagnostics,
+            req.toolNames,
+            req.toolsCount,
+          ),
+        },
+      };
+    }
+    const looksLikeLlm =
+      isLlmEndpoint(req.url) ||
+      req.model !== null ||
+      req.toolsCount > 0 ||
+      req.systemPromptChars > 0;
+    if (!req.rawBody || !looksLikeLlm) return req;
+    const snapshot = analyzePromptPrefix(req.rawBody, req.url);
+    if (!snapshot) return req;
+    return {
+      ...req,
+      cacheDiagnostics: tracker.observe(
+        index,
+        deriveSessionKey(req.url, undefined, req.rawBody),
+        snapshot,
+      ),
+    };
+  });
+}
+
 export function evaluateWireAssertions(
   requests: CapturedWireRequest[],
   assertions: WireTapAssertions = {},
-  meta: { mode?: WireTapMode } = {},
+  meta: { mode?: WireTapMode; rawBodyAvailable?: boolean } = {},
 ): WireTapReport {
-  const combinedRaw = requests.map((r) => r.rawBody).join("\n");
-  const totalPayloadBytes = requests.reduce((sum, r) => sum + r.bodyBytes, 0);
-  const estimatedTotalTokens = requests.reduce(
+  const enrichedRequests = ensureCacheDiagnostics(requests);
+  const rawBodyAvailable = meta.rawBodyAvailable ?? true;
+  const combinedRaw = enrichedRequests.map((r) => r.rawBody).join("\n");
+  const totalPayloadBytes = enrichedRequests.reduce(
+    (sum, r) => sum + r.bodyBytes,
+    0,
+  );
+  const estimatedTotalTokens = enrichedRequests.reduce(
     (sum, r) => sum + r.estimatedTokens,
     0,
   );
-  const maxToolsCount = requests.reduce(
+  const maxToolsCount = enrichedRequests.reduce(
     (max, r) => Math.max(max, r.toolsCount),
     0,
   );
   const modelsObserved = [
     ...new Set(
-      requests.map((r) => r.model).filter((m): m is string => Boolean(m)),
+      enrichedRequests
+        .map((r) => r.model)
+        .filter((m): m is string => Boolean(m)),
     ),
   ];
   const toolNamesObserved = [
-    ...new Set(requests.flatMap((r) => r.toolNames)),
+    ...new Set(enrichedRequests.flatMap((r) => r.toolNames)),
   ].sort();
+
+  const cacheDivergences = summarizeCacheDivergences(enrichedRequests);
+  const llmEntries = enrichedRequests
+    .map((req, index) => ({ req, index }))
+    .filter(
+      (entry): entry is { req: CapturedWireRequest & { cacheDiagnostics: CacheDiagnostics }; index: number } =>
+        entry.req.cacheDiagnostics !== undefined,
+    );
 
   const results: WireTapAssertionResult[] = [];
 
   for (const needle of assertions.assertContains ?? []) {
-    const passed = requests.length > 0 && combinedRaw.includes(needle);
+    const passed =
+      rawBodyAvailable &&
+      enrichedRequests.length > 0 &&
+      combinedRaw.includes(needle);
     results.push({
       kind: "contains",
       target: needle,
       passed,
       message: passed
         ? `Wire payload contains "${needle}".`
-        : `Expected wire payload to contain "${needle}", but it was not found.`,
+        : !rawBodyAvailable
+          ? `Cannot verify presence of "${needle}" because replayed trace records omit rawBody.`
+          : `Expected wire payload to contain "${needle}", but it was not found.`,
     });
   }
 
   for (const forbidden of assertions.assertNotContains ?? []) {
-    const passed = requests.length > 0 && !combinedRaw.includes(forbidden);
+    const passed =
+      rawBodyAvailable &&
+      enrichedRequests.length > 0 &&
+      !combinedRaw.includes(forbidden);
     results.push({
       kind: "not-contains",
       target: forbidden,
       passed,
       message: passed
         ? `Wire payload does not contain forbidden string "${forbidden}".`
-        : requests.length === 0
+        : enrichedRequests.length === 0
           ? `Cannot verify absence of "${forbidden}" because 0 wire requests were captured.`
-          : `Forbidden string "${forbidden}" was leaked in the outbound wire payload.`,
+          : !rawBodyAvailable
+            ? `Cannot verify absence of "${forbidden}" because replayed trace records omit rawBody.`
+            : `Forbidden string "${forbidden}" was leaked in the outbound wire payload.`,
     });
   }
 
   if (assertions.assertMaxBytes !== undefined) {
     const passed =
-      requests.length > 0 && totalPayloadBytes <= assertions.assertMaxBytes;
+      enrichedRequests.length > 0 &&
+      totalPayloadBytes <= assertions.assertMaxBytes;
     results.push({
       kind: "max-bytes",
       target: assertions.assertMaxBytes,
       passed,
       message: passed
         ? `Total wire payload (${totalPayloadBytes} bytes) is within budget (<= ${assertions.assertMaxBytes} bytes).`
-        : requests.length === 0
+        : enrichedRequests.length === 0
           ? `Cannot verify max-bytes budget (<= ${assertions.assertMaxBytes} bytes) because 0 wire requests were captured.`
           : `Total wire payload (${totalPayloadBytes} bytes) exceeded budget (> ${assertions.assertMaxBytes} bytes).`,
     });
@@ -545,39 +623,367 @@ export function evaluateWireAssertions(
 
   if (assertions.assertMaxTools !== undefined) {
     const passed =
-      requests.length > 0 && maxToolsCount <= assertions.assertMaxTools;
+      enrichedRequests.length > 0 && maxToolsCount <= assertions.assertMaxTools;
     results.push({
       kind: "max-tools",
       target: assertions.assertMaxTools,
       passed,
       message: passed
         ? `Maximum tools schema count (${maxToolsCount}) is within budget (<= ${assertions.assertMaxTools} tools).`
-        : requests.length === 0
+        : enrichedRequests.length === 0
           ? `Cannot verify max-tools budget (<= ${assertions.assertMaxTools} tools) because 0 wire requests were captured.`
           : `Maximum tools schema count (${maxToolsCount}) exceeded budget (> ${assertions.assertMaxTools} tools).`,
     });
   }
 
+  if (assertions.assertToolsSorted) {
+    if (enrichedRequests.length === 0 || llmEntries.length === 0) {
+      results.push({
+        kind: "tools-sorted",
+        target: "tools",
+        passed: false,
+        message:
+          enrichedRequests.length === 0
+            ? "Cannot verify tools[] sort order because 0 wire requests were captured."
+            : "Cannot verify tools[] sort order because 0 LLM requests with prompt-prefix diagnostics were captured.",
+      });
+    } else {
+      const bad = llmEntries
+        .filter((e) => !e.req.cacheDiagnostics.wireContract.toolsSorted)
+        .map((e) => {
+          const pair = e.req.cacheDiagnostics.wireContract.firstUnsortedPair;
+          return pair
+            ? `request #${e.index} (${e.req.url}): "${pair[0]}" > "${pair[1]}"`
+            : `request #${e.index} (${e.req.url})`;
+        });
+      const passed = bad.length === 0;
+      results.push({
+        kind: "tools-sorted",
+        target: "tools",
+        passed,
+        message: passed
+          ? `All ${llmEntries.length} LLM request(s) have deterministically sorted tools[] (localeCompare <= 0).`
+          : `Unsorted tools[] detected in ${bad.join("; ")} (expected localeCompare <= 0).`,
+      });
+    }
+  }
+
+  if (assertions.assertCacheBreakpointCoversTools) {
+    if (enrichedRequests.length === 0 || llmEntries.length === 0) {
+      results.push({
+        kind: "cache-breakpoint-covers-tools",
+        target: "tools",
+        passed: false,
+        message:
+          enrichedRequests.length === 0
+            ? "Cannot verify cache_control coverage over tools[] because 0 wire requests were captured."
+            : "Cannot verify cache_control coverage over tools[] because 0 LLM requests with prompt-prefix diagnostics were captured.",
+      });
+    } else {
+      const bad = llmEntries
+        .filter(
+          (e) => !e.req.cacheDiagnostics.wireContract.cacheBreakpointCoversTools,
+        )
+        .map((e) => {
+          const wc = e.req.cacheDiagnostics.wireContract;
+          return `request #${e.index} (${e.req.url}): lastToolBlockIndex=${wc.lastToolBlockIndex}, maxBreakpointBlockIndex=${wc.maxBreakpointBlockIndex ?? "none"}`;
+        });
+      const passed = bad.length === 0;
+      results.push({
+        kind: "cache-breakpoint-covers-tools",
+        target: "tools",
+        passed,
+        message: passed
+          ? `Cache breakpoints cover tools[] across all ${llmEntries.length} LLM request(s).`
+          : `Cache breakpoint does not cover all tools[] in ${bad.join("; ")} (no cache_control on tools[last], system, messages, or top-level).`,
+      });
+    }
+  }
+
+  if (assertions.assertNoPrefixDivergence) {
+    if (enrichedRequests.length === 0 || llmEntries.length === 0) {
+      results.push({
+        kind: "no-prefix-divergence",
+        target: "prefix",
+        passed: false,
+        message:
+          enrichedRequests.length === 0
+            ? "Cannot verify prompt-prefix stability because 0 wire requests were captured."
+            : "Cannot verify prompt-prefix stability because 0 LLM requests with prompt-prefix diagnostics were captured.",
+      });
+    } else {
+      const passed = cacheDivergences.length === 0;
+      results.push({
+        kind: "no-prefix-divergence",
+        target: "prefix",
+        passed,
+        message: passed
+          ? `No prompt-prefix divergence detected across ${llmEntries.length} LLM request(s).`
+          : `Detected ${cacheDivergences.length} prompt-prefix divergence(s): ${cacheDivergences
+              .map(
+                (d) =>
+                  `#${d.requestIndex} at ${d.firstDivergentIndex ?? d.firstDivergentLayer} (${d.firstDivergentLayer})`,
+              )
+              .join("; ")}.`,
+      });
+    }
+  }
+
+  for (const [rawLayer, rawPrefix] of Object.entries(
+    assertions.assertLayerHashes ?? {},
+  )) {
+    const layer = rawLayer.trim().toLowerCase();
+    const prefix = rawPrefix.trim().toLowerCase();
+    const target = `${layer}:${prefix}`;
+    if (!PROMPT_LAYER_ORDER.includes(layer as PromptLayer)) {
+      results.push({
+        kind: "layer-hash",
+        target,
+        passed: false,
+        message: `Invalid layer "${rawLayer}" in assertLayerHashes (expected model|system|tools|messages).`,
+      });
+      continue;
+    }
+    if (!/^[0-9a-f]{4,}$/.test(prefix)) {
+      results.push({
+        kind: "layer-hash",
+        target,
+        passed: false,
+        message: `Invalid hex prefix "${rawPrefix}" for layer "${layer}" (expected at least 4 hex chars).`,
+      });
+      continue;
+    }
+    if (enrichedRequests.length === 0 || llmEntries.length === 0) {
+      results.push({
+        kind: "layer-hash",
+        target,
+        passed: false,
+        message:
+          enrichedRequests.length === 0
+            ? `Cannot verify "${layer}" layer hash (${prefix}) because 0 wire requests were captured.`
+            : `Cannot verify "${layer}" layer hash (${prefix}) because 0 LLM requests with prompt-prefix diagnostics were captured.`,
+      });
+      continue;
+    }
+    const mismatches = llmEntries
+      .map((e) => {
+        const actual = (
+          e.req.cacheDiagnostics.layerHashes[layer as PromptLayer] ?? ""
+        ).toLowerCase();
+        return actual.startsWith(prefix)
+          ? null
+          : `request #${e.index} (${e.req.url}): got "${actual || "none"}"`;
+      })
+      .filter((m): m is string => m !== null);
+    const passed = mismatches.length === 0;
+    results.push({
+      kind: "layer-hash",
+      target,
+      passed,
+      message: passed
+        ? `Layer "${layer}" hash matches prefix "${prefix}" across all ${llmEntries.length} LLM request(s).`
+        : `Layer "${layer}" hash mismatch for prefix "${prefix}": ${mismatches.join("; ")}.`,
+    });
+  }
+
   const failures = results.filter((r) => !r.passed).map((r) => r.message);
-  if (requests.length === 0 && failures.length === 0) {
+  if (enrichedRequests.length === 0 && failures.length === 0) {
     failures.push("No outbound wire requests were captured during execution.");
   }
 
   return {
     status: failures.length === 0 ? "passed" : "failed",
-    requestsCaptured: requests.length,
+    requestsCaptured: enrichedRequests.length,
     totalPayloadBytes,
     estimatedTotalTokens,
     maxToolsCount,
     modelsObserved,
     toolNamesObserved,
-    requests: requests.map(({ rawBody: _raw, ...rest }) => rest),
+    requests: enrichedRequests.map(({ rawBody: _raw, ...rest }) => rest),
     assertions: results,
     failures,
-    mode: meta.mode ?? (requests.some((r) => r.upstream) ? "passthrough" : "mock"),
-    usageTotals: summarizeUsage(requests),
-    cacheDivergences: summarizeCacheDivergences(requests),
+    mode:
+      meta.mode ??
+      (enrichedRequests.some((r) => r.upstream) ? "passthrough" : "mock"),
+    usageTotals: summarizeUsage(enrichedRequests),
+    cacheDivergences,
   };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function traceRecordToCapturedRequest(
+  rec: Record<string, unknown>,
+): CapturedWireRequest {
+  const method = typeof rec.method === "string" ? rec.method : "POST";
+  const url = typeof rec.url === "string" ? rec.url : "/v1/messages";
+  const upstream = isPlainRecord(rec.upstream)
+    ? (rec.upstream as unknown as UpstreamExchange)
+    : undefined;
+
+  let base: CapturedWireRequest;
+  if (typeof rec.rawBody === "string") {
+    base = analyzeWirePayload(method, url, rec.rawBody);
+  } else {
+    const rawToolNames = Array.isArray(rec.toolNames)
+      ? rec.toolNames.filter((t): t is string => typeof t === "string")
+      : [];
+    const diagObj = isPlainRecord(rec.cacheDiagnostics)
+      ? (rec.cacheDiagnostics as unknown as CacheDiagnostics)
+      : undefined;
+    const toolsCount =
+      typeof rec.toolsCount === "number"
+        ? rec.toolsCount
+        : (diagObj?.layerBlockCounts?.tools ?? rawToolNames.length);
+    const bodyBytes = typeof rec.bodyBytes === "number" ? rec.bodyBytes : 0;
+    const toolsSchemaBytes =
+      typeof rec.toolsSchemaBytes === "number" ? rec.toolsSchemaBytes : 0;
+    base = {
+      method,
+      url,
+      model: typeof rec.model === "string" ? rec.model : null,
+      bodyBytes,
+      estimatedTokens:
+        typeof rec.estimatedTokens === "number"
+          ? rec.estimatedTokens
+          : Math.ceil(bodyBytes / 4),
+      systemPromptChars:
+        typeof rec.systemPromptChars === "number" ? rec.systemPromptChars : 0,
+      toolsCount,
+      toolNames:
+        rawToolNames.length > 0
+          ? rawToolNames
+          : (diagObj?.wireContract?.toolNames ?? []),
+      toolsSchemaBytes,
+      estimatedToolTokens:
+        typeof rec.estimatedToolTokens === "number"
+          ? rec.estimatedToolTokens
+          : Math.ceil(toolsSchemaBytes / 4),
+      rawBody: "",
+    };
+  }
+
+  if (isPlainRecord(rec.cacheDiagnostics)) {
+    const diag = rec.cacheDiagnostics as unknown as CacheDiagnostics;
+    base.cacheDiagnostics = {
+      ...diag,
+      wireContract: inferWireContract(diag, base.toolNames, base.toolsCount),
+    };
+  }
+  if (upstream) {
+    base.upstream = upstream;
+  }
+  return base;
+}
+
+/**
+ * Offline trace analyzer: reads a saved `--trace` `.jsonl` file or a saved
+ * `WireTapReport` JSON file, reconstructs diagnostics, `usageTotals`, and
+ * `cacheDivergences`, and evaluates `assertions`.
+ */
+export async function replayTraceFile(
+  tracePath: string,
+  assertions: WireTapAssertions = {},
+): Promise<WireTapReport> {
+  const fullPath = resolvePath(tracePath);
+  const content = (await readFile(fullPath, "utf8")).trim();
+  if (content.length === 0) {
+    return evaluateWireAssertions([], assertions, {
+      mode: "mock",
+      rawBodyAvailable: false,
+    });
+  }
+
+  let rawRecords: Array<Record<string, unknown>> = [];
+  let explicitMode: WireTapMode | undefined;
+
+  let parsedWhole: unknown;
+  let parsedAsSingleJson = false;
+  try {
+    parsedWhole = JSON.parse(content);
+    parsedAsSingleJson = true;
+  } catch {
+    parsedAsSingleJson = false;
+  }
+
+  if (parsedAsSingleJson) {
+    if (isPlainRecord(parsedWhole) && Array.isArray(parsedWhole.requests)) {
+      if (parsedWhole.mode === "mock" || parsedWhole.mode === "passthrough") {
+        explicitMode = parsedWhole.mode;
+      }
+      rawRecords = parsedWhole.requests.map((item, idx) => {
+        if (!isPlainRecord(item)) {
+          throw new Error(
+            `Invalid request entry at requests[${idx}] in "${tracePath}".`,
+          );
+        }
+        return item;
+      });
+    } else if (Array.isArray(parsedWhole)) {
+      rawRecords = parsedWhole.map((item, idx) => {
+        if (!isPlainRecord(item)) {
+          throw new Error(
+            `Invalid trace entry at index ${idx} in "${tracePath}".`,
+          );
+        }
+        return item;
+      });
+    } else if (isPlainRecord(parsedWhole)) {
+      rawRecords = [parsedWhole];
+    } else {
+      throw new Error(
+        `Trace file "${tracePath}" must contain JSONL records or a WireTapReport JSON object.`,
+      );
+    }
+  } else {
+    const lines = content.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!.trim();
+      if (!line) continue;
+      let parsedLine: unknown;
+      try {
+        parsedLine = JSON.parse(line);
+      } catch (err) {
+        throw new Error(
+          `Invalid JSON in trace file "${tracePath}" at line ${i + 1}: ${(err as Error).message}`,
+        );
+      }
+      if (!isPlainRecord(parsedLine)) {
+        throw new Error(
+          `Expected JSON object in trace file "${tracePath}" at line ${i + 1}.`,
+        );
+      }
+      rawRecords.push(parsedLine);
+    }
+  }
+
+  const hasNumericIndices =
+    rawRecords.length > 1 &&
+    rawRecords.every((r) => typeof r.index === "number" && Number.isFinite(r.index));
+  if (hasNumericIndices) {
+    rawRecords = rawRecords
+      .map((rec, pos) => ({ rec, pos }))
+      .sort(
+        (a, b) =>
+          (a.rec.index as number) - (b.rec.index as number) || a.pos - b.pos,
+      )
+      .map((entry) => entry.rec);
+  }
+
+  const mode: WireTapMode =
+    explicitMode ??
+    (rawRecords.some((r) => r.mode === "passthrough" || isPlainRecord(r.upstream))
+      ? "passthrough"
+      : "mock");
+  const rawBodyAvailable = rawRecords.some((r) => typeof r.rawBody === "string");
+  const requests = rawRecords.map(traceRecordToCapturedRequest);
+
+  return evaluateWireAssertions(requests, assertions, {
+    mode,
+    rawBodyAvailable,
+  });
 }
 
 export interface EphemeralWireTapServer {

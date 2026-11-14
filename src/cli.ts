@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { PROMPT_LAYER_ORDER, type PromptLayer } from "./prefix.js";
 import {
   normalizeUpstreamUrl,
   DEFAULT_ANTHROPIC_UPSTREAM,
@@ -16,6 +17,7 @@ import {
   evaluateWireAssertions,
   formatExchangeLine,
   renderWireTapReport,
+  replayTraceFile,
   runAgentCommandWithWireTap,
   startWireTapServer,
   type WireTapAssertions,
@@ -37,6 +39,7 @@ export interface ParsedWireTapCliArgs {
   /** Non-null when `--passthrough` / `--anthropic-upstream` / `--openai-upstream` is set. */
   passthrough: PassthroughOptions | null;
   traceFile?: string;
+  replayFile?: string;
   port?: number;
   host: string;
 }
@@ -49,11 +52,45 @@ function parsePort(value: string | undefined): number {
   return port;
 }
 
+function parseLayerHashArg(
+  raw: string | undefined,
+  out: Record<string, string>,
+): void {
+  if (!raw) {
+    throw new Error(
+      "--assert-layer-hash requires <model|system|tools|messages>:<hexPrefix>.",
+    );
+  }
+  const colon = raw.indexOf(":");
+  if (colon <= 0) {
+    throw new Error(
+      `--assert-layer-hash must be <layer>:<hexPrefix>, got "${raw}".`,
+    );
+  }
+  const layer = raw.slice(0, colon).trim().toLowerCase();
+  const hexPrefix = raw.slice(colon + 1).trim().toLowerCase();
+  if (!PROMPT_LAYER_ORDER.includes(layer as PromptLayer)) {
+    throw new Error(
+      `--assert-layer-hash layer must be one of model|system|tools|messages, got "${raw.slice(0, colon)}".`,
+    );
+  }
+  if (!/^[0-9a-f]{4,}$/i.test(hexPrefix)) {
+    throw new Error(
+      `--assert-layer-hash hexPrefix must be at least 4 hex characters, got "${raw.slice(colon + 1)}".`,
+    );
+  }
+  out[layer] = hexPrefix;
+}
+
 export function parseWireTapCliArgs(argv: string[]): ParsedWireTapCliArgs {
   const assertContains: string[] = [];
   const assertNotContains: string[] = [];
   let assertMaxBytes: number | undefined;
   let assertMaxTools: number | undefined;
+  let assertToolsSorted = false;
+  let assertCacheBreakpointCoversTools = false;
+  let assertNoPrefixDivergence = false;
+  const assertLayerHashes: Record<string, string> = {};
   let json = false;
   let outFile: string | undefined;
   let timeoutMs = 15_000;
@@ -65,6 +102,7 @@ export function parseWireTapCliArgs(argv: string[]): ParsedWireTapCliArgs {
   let anthropicUpstream: string | undefined;
   let openaiUpstream: string | undefined;
   let traceFile: string | undefined;
+  let replayFile: string | undefined;
   let port: number | undefined;
   let host = "127.0.0.1";
 
@@ -128,6 +166,23 @@ export function parseWireTapCliArgs(argv: string[]): ParsedWireTapCliArgs {
         throw new Error("--assert-max-tools must be a non-negative integer.");
       }
       assertMaxTools = val;
+    } else if (arg === "--assert-tools-sorted") {
+      assertToolsSorted = true;
+    } else if (arg === "--assert-cache-breakpoint-covers-tools") {
+      assertCacheBreakpointCoversTools = true;
+    } else if (arg === "--assert-no-prefix-divergence") {
+      assertNoPrefixDivergence = true;
+    } else if (arg === "--assert-layer-hash") {
+      parseLayerHashArg(argv[++i], assertLayerHashes);
+    } else if (arg.startsWith("--assert-layer-hash=")) {
+      parseLayerHashArg(
+        arg.slice("--assert-layer-hash=".length),
+        assertLayerHashes,
+      );
+    } else if (arg === "--replay" || arg.startsWith("--replay=")) {
+      const val = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : argv[++i];
+      if (!val) throw new Error("--replay requires a trace or report file path.");
+      replayFile = val;
     } else if (arg === "--out") {
       const val = argv[++i];
       if (!val) throw new Error("--out requires a file path.");
@@ -195,6 +250,11 @@ export function parseWireTapCliArgs(argv: string[]): ParsedWireTapCliArgs {
       "--passthrough <url> routes ALL traffic to one upstream; do not combine it with --anthropic-upstream / --openai-upstream.",
     );
   }
+  if (replayFile && (command !== null || passthroughEnabled)) {
+    throw new Error(
+      "--replay analyzes an offline trace/report file; do not combine it with --passthrough or a live agent command.",
+    );
+  }
   const passthrough: PassthroughOptions | null = passthroughEnabled
     ? {
         ...(passthroughUrl ? { upstream: passthroughUrl } : {}),
@@ -218,11 +278,20 @@ export function parseWireTapCliArgs(argv: string[]): ParsedWireTapCliArgs {
       assertNotContains,
       assertMaxBytes,
       assertMaxTools,
+      ...(assertToolsSorted ? { assertToolsSorted: true } : {}),
+      ...(assertCacheBreakpointCoversTools
+        ? { assertCacheBreakpointCoversTools: true }
+        : {}),
+      ...(assertNoPrefixDivergence ? { assertNoPrefixDivergence: true } : {}),
+      ...(Object.keys(assertLayerHashes).length > 0
+        ? { assertLayerHashes }
+        : {}),
     },
     command,
     commandArgs,
     passthrough,
     traceFile,
+    replayFile,
     port,
     host,
   };
@@ -233,9 +302,9 @@ function getVersion(): string {
     const pkg = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { version?: string };
-    return pkg.version ?? "0.2.0";
+    return pkg.version ?? "0.3.0";
   } catch {
-    return "0.2.0";
+    return "0.3.0";
   }
 }
 
@@ -247,15 +316,21 @@ function printHelp(): void {
       "Usage:",
       "  agent-wire-tap [options] -- <agent-command> [agent-args...]   Run one agent turn (mock or passthrough)",
       "  agent-wire-tap --passthrough [upstream-url] [options]         Long-running live reverse proxy (default port 8787)",
+      "  agent-wire-tap --replay <trace.jsonl|report.json> [options]   Analyze saved trace/report offline (exit 2 on failure)",
       "",
       "Options:",
-      "  --assert-contains <str>      Assert outbound wire payload contains marker (repeatable)",
-      "  --assert-not-contains <str>  Assert outbound wire payload never contains string/secret (repeatable)",
-      "  --assert-max-bytes <n>       Assert total outbound wire payload bytes <= n",
-      "  --assert-max-tools <n>       Assert tools[] count in outbound wire payload <= n",
-      "  --out <report.json>          Write structured JSON report to file",
-      "  --timeout-ms <ms>            Agent command timeout in ms (default: 15000; 600000 with --passthrough)",
-      "  --json                       Print structured JSON report to stdout",
+      "  --assert-contains <str>                 Assert outbound wire payload contains marker (repeatable)",
+      "  --assert-not-contains <str>             Assert outbound wire payload never contains string/secret (repeatable)",
+      "  --assert-max-bytes <n>                  Assert total outbound wire payload bytes <= n",
+      "  --assert-max-tools <n>                  Assert tools[] count in outbound wire payload <= n",
+      "  --assert-tools-sorted                   Assert tools[] are sorted ascending (localeCompare <= 0)",
+      "  --assert-cache-breakpoint-covers-tools  Assert cache_control covers tools[] (tools[last], system, messages, or top-level)",
+      "  --assert-no-prefix-divergence           Assert zero turn-over-turn prompt-prefix divergences",
+      "  --assert-layer-hash <layer:hexPrefix>   Assert model|system|tools|messages layer hash starts with hex prefix (min 4 chars, repeatable)",
+      "  --replay <file>                         Evaluate assertions offline against a saved --trace .jsonl or JSON report",
+      "  --out <report.json>                     Write structured JSON report to file",
+      "  --timeout-ms <ms>                       Agent command timeout in ms (default: 15000; 600000 with --passthrough)",
+      "  --json                                  Print structured JSON report to stdout",
       "",
       "Live passthrough & prompt-cache diagnostics:",
       "  --passthrough [url]          Forward requests to the REAL upstream and stream replies back (JSON + SSE).",
@@ -350,6 +425,13 @@ async function main(): Promise<void> {
   }
   if (parsed.version) {
     process.stdout.write(`${getVersion()}\n`);
+    return;
+  }
+  if (parsed.replayFile) {
+    await emitReport(
+      parsed,
+      await replayTraceFile(parsed.replayFile, parsed.assertions),
+    );
     return;
   }
   if (!parsed.command) {

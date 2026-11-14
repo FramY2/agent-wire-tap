@@ -1,6 +1,6 @@
 {
   "name": "@framy2/agent-wire-tap",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Zero-cost local loopback HTTP wire interceptor, CI context contract tester & live prompt-cache debugger for Claude Code, OpenAI Codex CLI, and custom AI agents.",
   "type": "module",
   "bin": {

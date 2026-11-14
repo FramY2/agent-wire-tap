@@ -2,6 +2,8 @@
 
 <p align="center">
   <a href="https://github.com/FramY2/agent-wire-tap/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/FramY2/agent-wire-tap?style=flat&logo=github&color=F59E0B" /></a>
+  <a href="https://www.npmjs.com/package/@framy2/agent-wire-tap"><img alt="npm version" src="https://img.shields.io/npm/v/%40framy2%2Fagent-wire-tap?color=7657FF&logo=npm" /></a>
+  <a href="https://www.npmjs.com/package/@framy2/agent-wire-tap"><img alt="npm downloads" src="https://img.shields.io/npm/dt/%40framy2%2Fagent-wire-tap?color=2DE2E6&logo=npm" /></a>
   <a href="https://github.com/FramY2/agent-wire-tap/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/FramY2/agent-wire-tap/actions/workflows/ci.yml/badge.svg" /></a>
   <img alt="Zero Dependencies" src="https://img.shields.io/badge/dependencies-0-brightgreen" />
   <img alt="Zero API Cost" src="https://img.shields.io/badge/API%20Cost-%240.00-7657FF" />
@@ -10,9 +12,10 @@
 
 **Local loopback HTTP wire interceptor, CI context contract tester & live prompt-cache debugger** for **Claude Code**, **OpenAI Codex CLI**, and custom coding agents.
 
-Two modes:
-1. **Mock / CI Contract Mode (default, `$0.00` API cost):** Starts an ephemeral local loopback server (`127.0.0.1:0` injected via `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`), captures outbound requests (`instructions` / `system`, `AGENTS.md` / `CLAUDE.md`, `tools[]` count & bytes), returns synthetic JSON/SSE replies, and asserts your context contracts.
-2. **Live `--passthrough` Reverse Proxy Mode (`v0.2.0`):** Forwards real requests to Anthropic / OpenAI (or any custom upstream), streams JSON & SSE responses chunk-by-chunk, extracts real `cache_read_input_tokens` / `cache_creation_input_tokens` / `cached_tokens` usage, and runs **turn-over-turn prompt prefix SHA-256 diffing** to pinpoint why prompt caching broke (`tools[i]`, `system[i]`, `model`, `messages[i]`, and `cache_control` breakpoint invalidation) — while **never** writing `Authorization`, `x-api-key`, `Proxy-Authorization`, or `Cookie` secrets to disk or stdout (`[REDACTED]`).
+Three workflows:
+1. **Mock / CI Contract Mode (default, `$0.00` API cost):** Starts an ephemeral local loopback server (`127.0.0.1:0` injected via `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`), captures outbound requests (`instructions` / `system`, `AGENTS.md` / `CLAUDE.md`, `tools[]` count & bytes), returns synthetic JSON/SSE replies, and asserts your context + serialized wire-prefix contracts (`--assert-tools-sorted`, `--assert-cache-breakpoint-covers-tools`, `--assert-no-prefix-divergence`, `--assert-layer-hash`).
+2. **Live `--passthrough` Reverse Proxy Mode (`v0.2.0`+):** Forwards real requests to Anthropic / OpenAI (or any custom upstream), streams JSON & SSE responses chunk-by-chunk, extracts real `cache_read_input_tokens` / `cache_creation_input_tokens` / `cached_tokens` usage, and runs **turn-over-turn prompt prefix SHA-256 diffing** to pinpoint why prompt caching broke (`tools[i]`, `system[i]`, `model`, `messages[i]`, and `cache_control` breakpoint invalidation) — while **never** writing `Authorization`, `x-api-key`, `Proxy-Authorization`, or `Cookie` secrets to disk or stdout (`[REDACTED]`).
+3. **Offline `--replay` Trace Analyzer (`v0.3.0`):** Replays a saved `--trace .jsonl` file or `--out report.json` in CI without hitting any LLM API, reconstructing `cacheDiagnostics`, `wireContract`, `usageTotals`, and `cacheDivergences` and exiting with code `2` on any failed assertion.
 
 Companion wire verifier to **[`FramY2/ctxwise`](https://github.com/FramY2/ctxwise)** (`@framy2/ctxwise`) and **[`FramY2/mcp-diet`](https://github.com/FramY2/mcp-diet)** (`@framy2/mcp-diet`).
 
@@ -20,7 +23,7 @@ Companion wire verifier to **[`FramY2/ctxwise`](https://github.com/FramY2/ctxwis
 
 ## ⚡ Quickstart
 
-### 1. CI Contract Testing (Zero API Cost)
+### 1. CI Contract & Serialized Wire-Prefix Testing (Zero API Cost)
 
 ```shell
 # Verify in CI that Codex loads AGENTS.md, stays under 32 KiB wire payload, and exposes <= 12 tools:
@@ -30,9 +33,34 @@ npx @framy2/agent-wire-tap \
   --assert-max-bytes 32768 \
   --assert-max-tools 12 \
   -- codex exec "ping"
+
+# Verify Anthropic wire-prefix cache contracts (v0.3.0):
+# - tools[] sorted ascending (matching mcp-diet's localeCompare sort)
+# - a cache_control breakpoint covers tools[last] (catches host-injected tools trailing a breakpoint!)
+# - zero turn-over-turn prefix divergences + pinned tools/system layer SHA-256 prefix
+npx @framy2/agent-wire-tap \
+  --assert-tools-sorted \
+  --assert-cache-breakpoint-covers-tools \
+  --assert-no-prefix-divergence \
+  --assert-layer-hash tools:8a3f9c02 \
+  -- claude -p "healthcheck"
 ```
 
-### 2. Live `--passthrough` & Prompt-Cache Miss Debugging
+### 2. Offline Trace Replay in CI (`--replay`)
+
+Replay any saved `--trace` `.jsonl` or `--out` JSON report offline (exits with code `2` if any assertion fails):
+
+```shell
+npx @framy2/agent-wire-tap \
+  --replay cache-trace.jsonl \
+  --assert-tools-sorted \
+  --assert-cache-breakpoint-covers-tools \
+  --assert-no-prefix-divergence \
+  --assert-layer-hash tools:8a3f9c02 \
+  --json
+```
+
+### 3. Live `--passthrough` & Prompt-Cache Miss Debugging
 
 Start the proxy once on `http://127.0.0.1:8787` (auto-routes `/v1/messages` -> `https://api.anthropic.com` and `/v1/responses` + `/v1/chat/completions` -> `https://api.openai.com`):
 
@@ -79,15 +107,21 @@ Credentials (`Authorization`, `x-api-key`, `Proxy-Authorization`, `Cookie`, `Set
 Usage:
   agent-wire-tap [options] -- <agent-command> [agent-args...]   Run one agent turn (mock or passthrough)
   agent-wire-tap --passthrough [upstream-url] [options]         Long-running live reverse proxy (default port 8787)
+  agent-wire-tap --replay <trace.jsonl|report.json> [options]   Analyze saved trace/report offline (exit 2 on failure)
 
 Options:
-  --assert-contains <str>      Assert outbound wire payload contains marker (repeatable)
-  --assert-not-contains <str>  Assert outbound wire payload never contains string/secret (repeatable)
-  --assert-max-bytes <n>       Assert total outbound wire payload bytes <= n
-  --assert-max-tools <n>       Assert tools[] count in outbound wire payload <= n
-  --out <report.json>          Write structured JSON report to file
-  --timeout-ms <ms>            Agent command timeout in ms (default: 15000; 600000 with --passthrough)
-  --json                       Print structured JSON report to stdout
+  --assert-contains <str>                 Assert outbound wire payload contains marker (repeatable)
+  --assert-not-contains <str>             Assert outbound wire payload never contains string/secret (repeatable)
+  --assert-max-bytes <n>                  Assert total outbound wire payload bytes <= n
+  --assert-max-tools <n>                  Assert tools[] count in outbound wire payload <= n
+  --assert-tools-sorted                   Assert tools[] are sorted ascending (localeCompare <= 0)
+  --assert-cache-breakpoint-covers-tools  Assert cache_control covers tools[] (tools[last], system, messages, or top-level)
+  --assert-no-prefix-divergence           Assert zero turn-over-turn prompt-prefix divergences
+  --assert-layer-hash <layer:hexPrefix>   Assert model|system|tools|messages layer hash starts with hex prefix (min 4 chars, repeatable)
+  --replay <file>                         Evaluate assertions offline against a saved --trace .jsonl or JSON report
+  --out <report.json>                     Write structured JSON report to file
+  --timeout-ms <ms>                       Agent command timeout in ms (default: 15000; 600000 with --passthrough)
+  --json                                  Print structured JSON report to stdout
 
 Live passthrough & prompt-cache diagnostics:
   --passthrough [url]          Forward requests to the REAL upstream and stream replies back (JSON + SSE).
@@ -115,6 +149,7 @@ import {
   evaluateWireAssertions,
   PromptCacheTracker,
   redactHeaders,
+  replayTraceFile,
   runAgentCommandWithWireTap,
   startWireTapServer,
 } from "@framy2/agent-wire-tap";
